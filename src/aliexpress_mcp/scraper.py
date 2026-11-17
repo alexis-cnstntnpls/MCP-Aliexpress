@@ -28,7 +28,7 @@ class AliExpressScraper:
             "region=FR&b_locale=fr_FR&site=fra&c_tp=EUR",
             domain=".aliexpress.com",
         )
-        self.base_headers = {
+        self.desktop_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
@@ -36,9 +36,17 @@ class AliExpressScraper:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
         }
+        self.mobile_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
 
     def _extract_item_list(self, html: str) -> List[Dict[str, Any]]:
-        """Extrait le tableau JSON itemList.content du HTML de recherche wholesale."""
+        """Extrait le tableau JSON itemList.content du HTML (compatible desktop et mobile)."""
         idx = html.find('"itemList":')
         if idx == -1:
             return []
@@ -52,7 +60,6 @@ class AliExpressScraper:
             return []
 
         depth = 0
-        end_idx = b_idx
         for i in range(b_idx, len(html)):
             char = html[i]
             if char == "[":
@@ -60,18 +67,14 @@ class AliExpressScraper:
             elif char == "]":
                 depth -= 1
                 if depth == 0:
-                    end_idx = i + 1
-                    break
+                    try:
+                        items_raw = json.loads(html[b_idx:i+1])
+                        return items_raw if isinstance(items_raw, list) else []
+                    except Exception as e:
+                        logger.warning(f"Erreur décodage JSON itemList: {e}")
+                        return []
 
-        if depth != 0:
-            return []
-
-        try:
-            items_raw = json.loads(html[b_idx:end_idx])
-            return items_raw if isinstance(items_raw, list) else []
-        except Exception as e:
-            logger.warning(f"Erreur décodage JSON itemList: {e}")
-            return []
+        return []
 
     def _format_image_url(self, url: Optional[str]) -> Optional[str]:
         if not url:
@@ -80,62 +83,8 @@ class AliExpressScraper:
             return f"https:{url}"
         return url
 
-    def search_products(
-        self,
-        query: str,
-        page: int = 1,
-        sort: str = "default",
-        min_price: Optional[float] = None,
-        max_price: Optional[float] = None,
-        free_shipping: bool = False,
-    ) -> ProductSearchResponse:
-        """
-        Recherche des produits sur AliExpress FR.
-        :param query: Termes de recherche
-        :param page: Numéro de page (1 par défaut)
-        :param sort: 'default', 'price_asc', 'price_desc', 'orders'
-        :param min_price: Prix minimum en EUR
-        :param max_price: Prix maximum en EUR
-        :param free_shipping: Filtrer uniquement livraison gratuite
-        """
-        clean_kw = "-".join(re.sub(r"[^\w\s-]", "", query).split())
-        if not clean_kw:
-            clean_kw = quote(query)
-
-        url = f"https://fr.aliexpress.com/w/wholesale-{clean_kw}.html"
-        params: Dict[str, Any] = {"page": page}
-
-        if sort == "price_asc":
-            params["sortType"] = "price_asc"
-        elif sort == "price_desc":
-            params["sortType"] = "price_desc"
-        elif sort in ("orders", "sales"):
-            params["sortType"] = "total_tranpro_desc"
-
-        if min_price is not None:
-            params["minPrice"] = min_price
-        if max_price is not None:
-            params["maxPrice"] = max_price
-
-        if free_shipping:
-            params["isFreeShip"] = "y"
-
-        resp = self.session.get(
-            url,
-            params=params,
-            headers=self.base_headers,
-            timeout=self.timeout,
-        )
-
-        if resp.status_code != 200:
-            logger.error(f"Échec recherche wholesale HTTP {resp.status_code}")
-            return ProductSearchResponse(
-                query=query, page=page, total_results=0, products=[]
-            )
-
-        items_raw = self._extract_item_list(resp.text)
+    def _parse_items(self, items_raw: List[Dict[str, Any]]) -> List[ProductSearchResult]:
         products: List[ProductSearchResult] = []
-
         for item in items_raw:
             pid = str(item.get("productId") or "")
             if not pid:
@@ -183,9 +132,7 @@ class AliExpressScraper:
             ship_from = item.get("trace", {}).get("pdpParams", {}).get("shipFrom")
 
             # Images
-            primary_img = self._format_image_url(
-                item.get("image", {}).get("imgUrl")
-            )
+            primary_img = self._format_image_url(item.get("image", {}).get("imgUrl"))
             gallery = []
             for img_obj in item.get("images", []):
                 img_u = self._format_image_url(img_obj.get("imgUrl"))
@@ -215,12 +162,105 @@ class AliExpressScraper:
                     product_url=product_url,
                 )
             )
+        return products
+
+    def search_products(
+        self,
+        query: str,
+        page: int = 1,
+        sort: str = "default",
+        min_price: Optional[float] = None,
+        max_price: Optional[float] = None,
+        free_shipping: bool = False,
+    ) -> ProductSearchResponse:
+        """
+        Recherche des produits sur AliExpress FR avec résilience double canal (Desktop -> Mobile fallback).
+        """
+        clean_kw = "-".join(re.sub(r"[^\w\s-]", "", query).split())
+        if not clean_kw:
+            clean_kw = quote(query)
+
+        # 1. Tentative Desktop
+        desktop_url = f"https://fr.aliexpress.com/w/wholesale-{clean_kw}.html"
+        desktop_params: Dict[str, Any] = {"page": page}
+
+        if sort == "price_asc":
+            desktop_params["sortType"] = "price_asc"
+        elif sort == "price_desc":
+            desktop_params["sortType"] = "price_desc"
+        elif sort in ("orders", "sales"):
+            desktop_params["sortType"] = "total_tranpro_desc"
+
+        if min_price is not None:
+            desktop_params["minPrice"] = min_price
+        if max_price is not None:
+            desktop_params["maxPrice"] = max_price
+
+        if free_shipping:
+            desktop_params["isFreeShip"] = "y"
+
+        try:
+            resp = self.session.get(
+                desktop_url,
+                params=desktop_params,
+                headers=self.desktop_headers,
+                timeout=self.timeout,
+            )
+            # Vérifier si on a un challenge anti-bot
+            if resp.status_code == 200 and "_____tmd_____/punish" not in resp.text:
+                items_raw = self._extract_item_list(resp.text)
+                if items_raw:
+                    products = self._parse_items(items_raw)
+                    return ProductSearchResponse(
+                        query=query,
+                        page=page,
+                        total_results=len(products),
+                        products=products,
+                    )
+        except Exception as e:
+            logger.debug(f"Erreur tentative desktop: {e}")
+
+        # 2. Repli automatique Mobile (m.aliexpress.com) hautement tolérant et non bloqué
+        logger.info(f"Basculement sur l'endpoint mobile pour: '{query}'")
+        mobile_url = f"https://m.aliexpress.com/wholesale/{clean_kw}.html"
+        mobile_params: Dict[str, Any] = {"page": page}
+
+        if sort == "price_asc":
+            mobile_params["sortParam"] = "priceAsc"
+        elif sort == "price_desc":
+            mobile_params["sortParam"] = "priceDesc"
+        elif sort in ("orders", "sales"):
+            mobile_params["sortParam"] = "ordersDesc"
+
+        if min_price is not None:
+            mobile_params["minPrice"] = min_price
+        if max_price is not None:
+            mobile_params["maxPrice"] = max_price
+
+        if free_shipping:
+            mobile_params["selectedSwitches"] = "filterCode:freeshipping"
+
+        try:
+            m_resp = self.session.get(
+                mobile_url,
+                params=mobile_params,
+                headers=self.mobile_headers,
+                timeout=self.timeout,
+            )
+            if m_resp.status_code == 200 and "_____tmd_____/punish" not in m_resp.text:
+                items_raw = self._extract_item_list(m_resp.text)
+                products = self._parse_items(items_raw)
+                return ProductSearchResponse(
+                    query=query,
+                    page=page,
+                    total_results=len(products),
+                    products=products,
+                )
+        except Exception as e:
+            logger.error(f"Erreur repli mobile: {e}")
 
         return ProductSearchResponse(
-            query=query,
-            page=page,
-            total_results=len(products),
-            products=products,
+            query=query, page=page, total_results=0, products=[]
         )
 
     def get_product_details(self, product_id_or_url: str) -> ProductDetail:
@@ -235,7 +275,7 @@ class AliExpressScraper:
         pid = id_match.group(1)
         url = f"https://fr.aliexpress.com/item/{pid}.html"
 
-        resp = self.session.get(url, headers=self.base_headers, timeout=self.timeout)
+        resp = self.session.get(url, headers=self.desktop_headers, timeout=self.timeout)
         if resp.status_code != 200:
             raise RuntimeError(f"Échec accès produit {pid} (HTTP {resp.status_code})")
 
@@ -261,7 +301,6 @@ class AliExpressScraper:
         if not gallery and cover_image:
             gallery.append(cover_image)
 
-        # Recherche correspondante pour récupérer prix, notation et expédition
         price_formatted = None
         price_eur = None
         original_price_eur = None
@@ -278,9 +317,8 @@ class AliExpressScraper:
         except Exception as e:
             logger.debug(f"Note non disponible via feedback: {e}")
 
-        # On extrait les termes les plus pertinents du titre (mots alphanumériques / modèles)
+        # On extrait les termes les plus pertinents du titre pour retrouver prix et expédition
         words = [w for w in re.sub(r"[^\w\s-]", " ", title).split() if len(w) >= 3]
-        # Essayer d'abord avec les 2 premiers mots pertinents
         search_candidates = []
         if len(words) >= 2:
             search_candidates.append(" ".join(words[:2]))
@@ -294,7 +332,6 @@ class AliExpressScraper:
                 search_res = self.search_products(cand, page=1)
                 matched = next((p for p in search_res.products if p.product_id == pid), None)
                 if not matched:
-                    # Tenter avec tri par ventes
                     search_res_orders = self.search_products(cand, page=1, sort="orders")
                     matched = next((p for p in search_res_orders.products if p.product_id == pid), None)
 
@@ -356,7 +393,7 @@ class AliExpressScraper:
             "filter": filter_type if filter_type in ("all", "local", "image") else "all",
         }
 
-        resp = self.session.get(url, params=params, headers=self.base_headers, timeout=self.timeout)
+        resp = self.session.get(url, params=params, headers=self.desktop_headers, timeout=self.timeout)
         if resp.status_code != 200:
             raise RuntimeError(f"Échec récupération avis (HTTP {resp.status_code})")
 
@@ -370,7 +407,7 @@ class AliExpressScraper:
 
         reviews_list: List[ProductReview] = []
         for eva in data.get("evaViewList", []):
-            buyer_eval = eva.get("buyerEval")  # ex: 100, 80, 60...
+            buyer_eval = eva.get("buyerEval")
             stars = (float(buyer_eval) / 20.0) if buyer_eval is not None else None
 
             rev_imgs = [
